@@ -1,34 +1,41 @@
-# TODO
-# Receive mission phase from ground control
-# Match mission phase to entry point
-
-
-
-# Phase 1: Take off, orient to target, and fly to target N & E
-# Phase 2: Ensure we're within target radius, initiate land
-# Phase 3: Ensure megadrone coordinates are stable for more than 5 seconds and is in a disarmed state, then initiate takeoff
-# Phase 4: Fly to megadrone N & E
-# Phase 5: Loop until we see the landing apriltag ID beneath the DEXI, once we see the landing apriltag ID for more than 5 seconds, allow phase 6
-# Phase 6: Switch to apriltag landing mode and orient to apriltag, then land
-
-
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 
-from mission_interfaces.msg import MissionPhase
 from dexi_interfaces.srv import LEDRingColor
 
 
-class WorkerNode(Node):
+class MissionNode(Node):
 	def __init__(self):
-		super().__init__("worker_node")
+		super().__init__("mission_node")
 		
-		self.phase_sub = self.create_subscription(MissionPhase, "/mission_phase", self.on_phase, 10)
+		self.phase = 0
+		self.phase_min = 1
+		self.phase_max = 6
+		
+		self.declare_parameter("mission_phase", 0)
+		self.add_on_set_parameters_callback(self.on_set_params)
+		
 		self.led_client = self.create_client(LEDRingColor, "/dexi/led_service/set_led_ring_color")
+		self.mission_timer = self.create_timer(0.1, self.mission_step)
 	
-	def on_phase(self, msg):
-		self.get_logger().info(f"phase {msg.phase} received: {msg.note}")
-		self.set_led_ring("blue")
+	def on_set_params(self, params):
+		for param in params:
+			if param.name != "mission_phase":
+				continue
+			
+			if param.value < self.phase_min or param.value > self.phase_max:
+				return SetParametersResult(successful = False, reason = f"phase {param.value} out of range")
+			
+			self.phase = param.value
+			self.get_logger().info(f"phase set to {self.phase}")
+			self.set_led_ring("blue")
+		
+		return SetParametersResult(successful = True, reason = f"now in phase {self.phase}")
+	
+	def mission_step(self):
+		# runs 10x per second, put per-phase logic here later
+		pass
 	
 	def set_led_ring(self, color):
 		if not self.led_client.service_is_ready():
@@ -50,7 +57,7 @@ class WorkerNode(Node):
 def main():
 	rclpy.init()
 	
-	node = WorkerNode()
+	node = MissionNode()
 	rclpy.spin(node)
 	
 	node.destroy_node()
