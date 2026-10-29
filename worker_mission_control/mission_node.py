@@ -3,7 +3,7 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 
 from dexi_interfaces.srv import LEDRingColor
-
+from std_msgs.msg import String
 
 class MissionNode(Node):
 	def __init__(self):
@@ -18,7 +18,14 @@ class MissionNode(Node):
 		
 		self.led_client = self.create_client(LEDRingColor, "/dexi/led_service/set_led_ring_color")
 		self.mission_timer = self.create_timer(0.1, self.mission_step)
+
+		self.megadrone_sub = self.create_subscription(String, "megadrone/incoming", self.on_megadrone_msg, 10)
 	
+	def on_megadrone_msg(self, msg):
+		data = json.loads(msg.data)
+		
+		self.get_logger().info(data)
+
 	def on_set_params(self, params):
 		for param in params:
 			if param.name != "mission_phase":
