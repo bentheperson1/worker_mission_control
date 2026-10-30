@@ -21,6 +21,7 @@ def generate_launch_description():
 		output = "screen",
 		parameters = [{
 			"mission_phase": 0,
+			"initial_takeoff_altitude": 15,
 		}],
 	)
 	
