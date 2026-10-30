@@ -33,10 +33,19 @@ class MissionNode(Node):
 			
 			if param.value < self.phase_min or param.value > self.phase_max:
 				return SetParametersResult(successful = False, reason = f"phase {param.value} out of range")
-			
+							
+			# if param.value != emergencyKill && self.phase.isComplete() == false:
+				# return SetParametersResult(successful = False, reason = "Current phase not complete.")
+
+			# Implement phase objects
+			# 
+
 			self.phase = param.value
 			self.get_logger().info(f"phase set to {self.phase}")
 			self.set_led_ring("blue")
+
+
+
 		
 		return SetParametersResult(successful = True, reason = f"now in phase {self.phase}")
 	
