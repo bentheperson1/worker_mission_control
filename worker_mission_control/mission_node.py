@@ -49,6 +49,13 @@ class MissionNode(Node):
 		self.arrive_ticks = 0
 		self.arrive_ticks_needed = 10
 
+		self.megadrone_lat = 0.0
+		self.megadrone_lon = 0.0
+		self.megadrone_alt = 0.0
+		self.megadrone_fix_type = 0
+		self.megadrone_satellites = 0
+		self.megadrone_time = 0.0
+
 		# phase: (async enter or None, sync step or None)
 		self.phases = {
 			0: (self.enter_takeoff, None),
@@ -70,7 +77,7 @@ class MissionNode(Node):
 		self.offboard_publisher = self.create_publisher(OffboardNavCommand, "/dexi/offboard_nav_command", 10)
 
 		self.position_sub = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.on_position, px4_qos)
-		self.megadrone_sub = self.create_subscription(String, "megadrone/incoming", self.on_megadrone_msg, 10)
+		self.megadrone_sub = self.create_subscription(String, "/megadrone/incoming", self.on_megadrone_msg, 10)
 
 		if not self.flight_client.wait_for_service(timeout_sec=10.0):
 			raise RuntimeError("/dexi/flight/command is not available; is the offboard manager running?")
@@ -276,9 +283,20 @@ class MissionNode(Node):
 		return SetParametersResult(successful=True)
 
 	def on_megadrone_msg(self, msg):
-		data = json.loads(msg.data)
+		try:
+			data = json.loads(msg.data)
+		except json.JSONDecodeError as e:
+			self.get_logger().error(f"bad megadrone json: {e}")
+			return
 
-		self.get_logger().info(str(data))
+		self.megadrone_lat = data.get("lat", self.megadrone_lat)
+		self.megadrone_lon = data.get("lon", self.megadrone_lon)
+		self.megadrone_alt = data.get("alt", self.megadrone_alt)
+		self.megadrone_fix_type = data.get("fix_type", self.megadrone_fix_type)
+		self.megadrone_satellites = data.get("satellites", self.megadrone_satellites)
+		self.megadrone_time = data.get("time", self.megadrone_time)
+
+		self.get_logger().info(str(data), throttle_duration_sec=1.0)
 
 	def set_led_ring(self, color):
 		if not self.led_client.service_is_ready():

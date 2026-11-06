@@ -1,4 +1,5 @@
 import asyncio
+import json
 import queue
 import threading
 
@@ -14,22 +15,24 @@ class MegadroneBridgeNode(Node):
 	def __init__(self):
 		super().__init__("megadrone_bridge_node")
 		
-		self.declare_parameter("megadrone_websocket_url", "ws://localhost:8765")
+		self.declare_parameter("megadrone_websocket_url", "ws://megadrone.local:8765")
 		self.declare_parameter("megadrone_reconnect_delay", 5.0)
 		
 		self.incoming = queue.Queue()
-
-		self.incoming = queue.Queue()
-		self.incoming_pub = self.create_publisher(String, "megadrone/incoming", 10)
+		self.incoming_pub = self.create_publisher(String, "/megadrone/incoming", 10)
 		self.drain_timer = self.create_timer(0.01, self.drain_queue)
 		
 		self.loop = asyncio.new_event_loop()
-		self.ws_thread = threading.Thread(target = self.run_loop, daemon = True)
+		self.ws_thread = threading.Thread(target=self.run_loop, daemon=True)
 		self.ws_thread.start()
 	
 	def run_loop(self):
 		asyncio.set_event_loop(self.loop)
-		self.loop.run_until_complete(self.listen())
+		
+		try:
+			self.loop.run_until_complete(self.listen())
+		except Exception as e:
+			self.get_logger().error(f"listener thread died: {type(e).__name__}: {e}")
 	
 	async def listen(self):
 		url = self.get_parameter("megadrone_websocket_url").value
@@ -42,16 +45,24 @@ class MegadroneBridgeNode(Node):
 					
 					async for raw in ws:
 						self.incoming.put(raw)
-			except (OSError, websockets.ConnectionClosed) as e:
-				self.get_logger().warn(f"websocket error: {e}, retrying in {delay}s")
-				await asyncio.sleep(delay)
+				
+				self.get_logger().warn(f"websocket closed, retrying in {delay}s")
+			except Exception as e:
+				self.get_logger().warn(f"websocket error: {type(e).__name__}: {e}, retrying in {delay}s")
+			
+			await asyncio.sleep(delay)
 	
 	def drain_queue(self):
 		while not self.incoming.empty():
-			parsed = parse_message(self.incoming.get_nowait())
+			raw = self.incoming.get_nowait()
+			parsed = parse_message(raw)
 			
 			if parsed is None:
+				self.get_logger().warn(f"parse_message dropped: {raw}", throttle_duration_sec=2.0)
 				continue
+			
+			if not isinstance(parsed, str):
+				parsed = json.dumps(parsed)
 			
 			msg = String()
 			msg.data = parsed
