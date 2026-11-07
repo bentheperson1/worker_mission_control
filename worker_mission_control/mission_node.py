@@ -11,6 +11,10 @@ from std_srvs.srv import Trigger
 
 from px4_msgs.msg import VehicleLocalPosition
 from dexi_interfaces.srv import FlightCommand, LEDRingColor
+from dexi_interfaces.msg import OffboardNavCommand
+
+
+EARTH_RADIUS = 6371000.0
 
 
 class MissionNode(Node):
@@ -19,6 +23,8 @@ class MissionNode(Node):
 
 		self.declare_parameter("initial_takeoff_altitude", 10)
 		self.declare_parameter("mission_phase", 0)
+		self.declare_parameter("target_lat", 0.0)
+		self.declare_parameter("target_lon", 0.0)
 		self.add_on_set_parameters_callback(self.on_set_params)
 
 		self.tick_rate = 0.1
@@ -37,8 +43,14 @@ class MissionNode(Node):
 		self.position_valid = False
 		self.heading = 0.0
 
+		self.ref_lat = 0.0
+		self.ref_lon = 0.0
+		self.ref_alt = 0.0
+		self.ref_valid = False
+
 		self.goto_timeout = 60.0
 		self.land_timeout = 60.0
+		self.ref_timeout = 10.0
 
 		self.megadrone_lat = 0.0
 		self.megadrone_lon = 0.0
@@ -53,6 +65,8 @@ class MissionNode(Node):
 			history=HistoryPolicy.KEEP_LAST,
 			depth=1,
 		)
+
+		self.velocity_publisher = self.create_publisher(OffboardNavCommand, "/dexi/offboard_manager", px4_qos)
 
 		self.led_client = self.create_client(LEDRingColor, "/dexi/led_service/set_led_ring_color")
 		self.flight_client = self.create_client(FlightCommand, "/dexi/flight/command")
@@ -71,17 +85,20 @@ class MissionNode(Node):
 	def build_mission(self):
 		alt = float(self.get_parameter("initial_takeoff_altitude").value)
 
+		target_lat = float(self.get_parameter("target_lat").value)
+		target_lon = float(self.get_parameter("target_lon").value)
+
 		return [
 			("confirm arm", lambda: self.wait_for_go("ready to arm and take off")),
 			("takeoff", lambda: self.takeoff(alt)),
-			("confirm fly out", lambda: self.wait_for_go("hovering, ready to fly out")),
-			("fly out", lambda: self.fly_to(10.0, 0.0, -alt)),
+			("confirm fly out", lambda: self.wait_for_go(f"hovering, ready to fly to ({target_lat:.7f}, {target_lon:.7f})")),
+			("fly out", lambda: self.fly_to_gps(target_lat, target_lon, alt)),
 			("confirm land", lambda: self.wait_for_go("at target, ready to land")),
 			("land", lambda: self.land()),
 			("confirm second takeoff", lambda: self.wait_for_go("landed, ready to take off again")),
 			("takeoff", lambda: self.takeoff(alt)),
 			("confirm fly home", lambda: self.wait_for_go("hovering, ready to fly home")),
-			("fly home", lambda: self.fly_to(0.0, 0.0, -alt)),
+			("fly home", lambda: self.fly_to_gps(0.0, 0.0, -alt)),
 			("confirm final land", lambda: self.wait_for_go("home, ready to land")),
 			("land", lambda: self.land()),
 		]
@@ -182,6 +199,68 @@ class MissionNode(Node):
 
 		await self.flight("goto_ned", north=north, east=east, down=down, yaw=yaw, timeout=timeout)
 
+	def gps_to_ned(self, lat, lon):
+		lat_rad = math.radians(lat)
+		lon_rad = math.radians(lon)
+		ref_lat_rad = math.radians(self.ref_lat)
+		ref_lon_rad = math.radians(self.ref_lon)
+
+		sin_lat = math.sin(lat_rad)
+		cos_lat = math.cos(lat_rad)
+		ref_sin_lat = math.sin(ref_lat_rad)
+		ref_cos_lat = math.cos(ref_lat_rad)
+		cos_d_lon = math.cos(lon_rad - ref_lon_rad)
+
+		arg = max(-1.0, min(1.0, ref_sin_lat * sin_lat + ref_cos_lat * cos_lat * cos_d_lon))
+		c = math.acos(arg)
+		k = 1.0 if abs(c) < 1e-9 else c / math.sin(c)
+
+		north = k * (ref_cos_lat * sin_lat - ref_sin_lat * cos_lat * cos_d_lon) * EARTH_RADIUS
+		east = k * cos_lat * math.sin(lon_rad - ref_lon_rad) * EARTH_RADIUS
+
+		return north, east
+
+	async def fly_to_gps(self, lat, lon, alt=None, alt_relative=True, yaw=None, timeout=None):
+		if lat == 0.0 and lon == 0.0:
+			raise RuntimeError("gps target is (0, 0); set target_lat and target_lon")
+
+		await self.wait_until(lambda: self.ref_valid, timeout=self.ref_timeout, name="global position reference")
+
+		north, east = self.gps_to_ned(lat, lon)
+
+		if alt is None:
+			down = self.position_down
+		elif alt_relative:
+			down = -alt
+		else:
+			down = -(alt - self.ref_alt)
+
+		self.get_logger().info(f"gps ({lat:.7f}, {lon:.7f}) -> ned ({north:.1f}, {east:.1f}, {down:.1f})")
+
+		await self.fly_to(north, east, down, yaw, timeout)
+
+	async def fly_to_megadrone(self, alt):
+		if self.megadrone_fix_type < 3:
+			raise RuntimeError(f"megadrone has no 3d fix (fix_type {self.megadrone_fix_type})")
+
+		await self.fly_to_gps(self.megadrone_lat, self.megadrone_lon, alt)
+
+	async def fly_velocity(self, forward, right, down, yaw_rate, duration):
+		self.get_logger().info(f"velocity: forward={forward} right={right} down={down} yaw_rate={yaw_rate:.1f} for {duration:.1f}s")
+
+		msg = OffboardNavCommand()
+		msg.command = "set_velocity_body"
+		msg.north = float(forward)
+		msg.east = float(right)
+		msg.down = float(down)
+		msg.yaw = float(yaw_rate)
+
+		end = self.now() + duration
+
+		while self.now() < end:
+			self.velocity_publisher.publish(msg)
+			await self.tick()
+
 	async def set_led(self, color):
 		if not self.led_client.service_is_ready():
 			self.get_logger().warn("led service not ready, skipping")
@@ -242,6 +321,11 @@ class MissionNode(Node):
 		self.heading = msg.heading
 
 		self.position_valid = msg.xy_valid and msg.z_valid
+
+		self.ref_lat = msg.ref_lat
+		self.ref_lon = msg.ref_lon
+		self.ref_alt = msg.ref_alt
+		self.ref_valid = msg.xy_global and msg.z_global
 
 	def on_set_params(self, params):
 		for param in params:
