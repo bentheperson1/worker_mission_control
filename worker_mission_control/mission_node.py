@@ -4,11 +4,12 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.task import Future
 from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 from px4_msgs.msg import VehicleLocalPosition
-from dexi_interfaces.msg import OffboardNavCommand
 from dexi_interfaces.srv import FlightCommand, LEDRingColor
 
 
@@ -20,15 +21,15 @@ class MissionNode(Node):
 		self.declare_parameter("mission_phase", 0)
 		self.add_on_set_parameters_callback(self.on_set_params)
 
-		self.phase = 0
-		self.phase_min = 0
-		self.phase_max = 2
-		self.phase_entered = False
-		self.phase_requested = None
-		self.phase_start_time = None
+		self.tick_rate = 0.1
+		self.tick_waiters = []
 
 		self.task = None
+		self.phase = -1
+		self.phase_requested = self.get_parameter("mission_phase").value
 		self.flying = False
+
+		self.go_received = False
 
 		self.position_north = 0.0
 		self.position_east = 0.0
@@ -36,18 +37,8 @@ class MissionNode(Node):
 		self.position_valid = False
 		self.heading = 0.0
 
-		self.target_north = 0.0
-		self.target_east = 0.0
-		self.target_down = 0.0
-		self.target_tolerance = 0.5
-
-		self.nav_gain = 0.6
-		self.nav_max_speed_h = 2.0
-		self.nav_max_speed_v = 1.0
-		self.nav_timeout = 60.0
-
-		self.arrive_ticks = 0
-		self.arrive_ticks_needed = 10
+		self.goto_timeout = 60.0
+		self.land_timeout = 60.0
 
 		self.megadrone_lat = 0.0
 		self.megadrone_lon = 0.0
@@ -55,13 +46,6 @@ class MissionNode(Node):
 		self.megadrone_fix_type = 0
 		self.megadrone_satellites = 0
 		self.megadrone_time = 0.0
-
-		# phase: (async enter or None, sync step or None)
-		self.phases = {
-			0: (self.enter_takeoff, None),
-			1: (self.enter_fly_to_point, self.step_fly_to_point),
-			2: (self.enter_land, None),
-		}
 
 		px4_qos = QoSProfile(
 			reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -73,8 +57,7 @@ class MissionNode(Node):
 		self.led_client = self.create_client(LEDRingColor, "/dexi/led_service/set_led_ring_color")
 		self.flight_client = self.create_client(FlightCommand, "/dexi/flight/command")
 
-		# replace with the topic your offboard manager listens on
-		self.offboard_publisher = self.create_publisher(OffboardNavCommand, "/dexi/offboard_nav_command", 10)
+		self.go_service = self.create_service(Trigger, "~/go", self.on_go)
 
 		self.position_sub = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.on_position, px4_qos)
 		self.megadrone_sub = self.create_subscription(String, "/megadrone/incoming", self.on_megadrone_msg, 10)
@@ -82,151 +65,135 @@ class MissionNode(Node):
 		if not self.flight_client.wait_for_service(timeout_sec=10.0):
 			raise RuntimeError("/dexi/flight/command is not available; is the offboard manager running?")
 
-		self.mission_timer = self.create_timer(0.1, self.mission_step)
+		self.tick_timer = self.create_timer(self.tick_rate, self.on_tick)
 
-	# ---------- core loop (sync, never blocks) ----------
 
-	def mission_step(self):
+	def build_mission(self):
+		alt = float(self.get_parameter("initial_takeoff_altitude").value)
+
+		return [
+			("confirm arm", lambda: self.wait_for_go("ready to arm and take off")),
+			("takeoff", lambda: self.takeoff(alt)),
+			("confirm fly out", lambda: self.wait_for_go("hovering, ready to fly out")),
+			("fly out", lambda: self.fly_to(10.0, 0.0, -alt)),
+			("confirm land", lambda: self.wait_for_go("at target, ready to land")),
+			("land", lambda: self.land()),
+			("confirm second takeoff", lambda: self.wait_for_go("landed, ready to take off again")),
+			("takeoff", lambda: self.takeoff(alt)),
+			("confirm fly home", lambda: self.wait_for_go("hovering, ready to fly home")),
+			("fly home", lambda: self.fly_to(0.0, 0.0, -alt)),
+			("confirm final land", lambda: self.wait_for_go("home, ready to land")),
+			("land", lambda: self.land()),
+		]
+
+	def on_tick(self):
 		if self.phase_requested is not None:
-			if self.task is not None:
-				self.task.cancel()
-				self.task = None
-
-			self.set_phase(self.phase_requested)
+			start = self.phase_requested
 			self.phase_requested = None
+			self.start_mission(start)
 
-		if self.task is not None:
-			if not self.task.done():
-				return
+		waiters = self.tick_waiters
+		self.tick_waiters = []
 
-			error = self.task.exception()
-			self.task = None
+		for future in waiters:
+			future.set_result(None)
 
-			if error is not None:
-				self.get_logger().error(f"phase {self.phase} failed: {error}")
-				self.abort()
-				return
+	def start_mission(self, start):
+		if self.task is not None and not self.task.done():
+			self.task.cancel()
 
-		if self.phase not in self.phases:
+		self.task = self.executor.create_task(self.run_mission, start)
+
+	async def run_mission(self, start):
+		mission = self.build_mission()
+
+		try:
+			for i in range(start, len(mission)):
+				name, action = mission[i]
+
+				self.phase = i
+				self.get_logger().info(f"phase {i}: {name}")
+
+				await action()
+		except Exception as e:
+			self.get_logger().error(f"phase {self.phase} failed: {e}")
+			await self.abort()
 			return
 
-		on_enter, on_step = self.phases[self.phase]
-
-		if not self.phase_entered:
-			self.phase_entered = True
-			self.phase_start_time = self.get_clock().now()
-
-			if on_enter is not None:
-				self.task = self.executor.create_task(on_enter)
-				return
-
-		if on_step is None or on_step():
-			self.set_phase(self.phase + 1)
-
-	def set_phase(self, phase):
-		self.phase = phase
-		self.phase_entered = False
-		self.get_logger().info(f"entering phase {self.phase}")
-
-	def abort(self):
 		self.phase = -1
-		self.phase_entered = False
+		self.get_logger().info("mission complete")
+
+	async def abort(self):
+		self.phase = -1
 
 		if self.flying:
-			self.task = self.executor.create_task(self.flight, "land", check=False)
+			self.get_logger().warn("aborting, landing")
 
-	def phase_elapsed(self):
-		return (self.get_clock().now() - self.phase_start_time).nanoseconds / 1e9
+			if await self.flight("land", timeout=self.land_timeout, check=False):
+				await self.flight("disarm", check=False)
 
-	# ---------- phases ----------
 
-	async def enter_takeoff(self):
-		takeoff_alt = self.get_parameter("initial_takeoff_altitude").value
+	def now(self):
+		return self.get_clock().now().nanoseconds / 1e9
 
+	async def tick(self):
+		future = Future()
+		self.tick_waiters.append(future)
+		await future
+
+	async def sleep(self, seconds):
+		end = self.now() + seconds
+
+		while self.now() < end:
+			await self.tick()
+
+	async def wait_until(self, condition, timeout=None, name="condition"):
+		start = self.now()
+
+		while not condition():
+			if timeout is not None and self.now() - start > timeout:
+				raise RuntimeError(f"timed out waiting for {name}")
+
+			await self.tick()
+
+	async def wait_for_go(self, prompt="waiting for go"):
+		self.go_received = False
+		self.get_logger().info(f"{prompt}: ros2 service call /mission_node/go std_srvs/srv/Trigger")
+
+		await self.wait_until(lambda: self.go_received)
+
+	async def takeoff(self, alt):
 		await self.flight("arm")
-		await self.flight("offboard_takeoff", takeoff_alt)
+		await self.flight("offboard_takeoff", alt)
 
-	async def enter_fly_to_point(self):
-		self.target_north = 10.0
-		self.target_east = 0.0
-		self.target_down = -self.get_parameter("initial_takeoff_altitude").value
+	async def land(self):
+		await self.flight("land", timeout=self.land_timeout)
+		await self.flight("disarm")
 
-		self.arrive_ticks = 0
+	async def fly_to(self, north, east, down, yaw=None, timeout=None):
+		if north == 0.0 and east == 0.0 and down == 0.0:
+			raise RuntimeError("goto_ned ignores an all-zero target; give a nonzero down")
 
-	def step_fly_to_point(self):
-		if not self.position_valid:
-			self.get_logger().warn("no valid position yet, holding", throttle_duration_sec=1.0)
-			self.send_velocity_body(0.0, 0.0, 0.0)
-			return False
+		if yaw is None:
+			yaw = math.degrees(self.heading)
 
-		elapsed = self.phase_elapsed()
+		if timeout is None:
+			timeout = self.goto_timeout
 
-		if elapsed > self.nav_timeout:
-			self.get_logger().error(f"fly_to_point timed out after {elapsed:.1f} s")
-			self.send_velocity_body(0.0, 0.0, 0.0)
-			self.abort()
-			return False
+		await self.flight("goto_ned", north=north, east=east, down=down, yaw=yaw, timeout=timeout)
 
-		dn = self.target_north - self.position_north
-		de = self.target_east - self.position_east
-		dd = self.target_down - self.position_down
+	async def set_led(self, color):
+		if not self.led_client.service_is_ready():
+			self.get_logger().warn("led service not ready, skipping")
+			return
 
-		vn = dn * self.nav_gain
-		ve = de * self.nav_gain
-		vd = dd * self.nav_gain
+		request = LEDRingColor.Request()
+		request.color = color
 
-		speed_h = math.hypot(vn, ve)
+		result = await self.led_client.call_async(request)
 
-		if speed_h > self.nav_max_speed_h:
-			scale = self.nav_max_speed_h / speed_h
-			vn *= scale
-			ve *= scale
-
-		vd = max(-self.nav_max_speed_v, min(vd, self.nav_max_speed_v))
-
-		cos_h = math.cos(self.heading)
-		sin_h = math.sin(self.heading)
-
-		forward = vn * cos_h + ve * sin_h
-		right = -vn * sin_h + ve * cos_h
-
-		if self.distance_to_target() < self.target_tolerance:
-			self.arrive_ticks += 1
-		else:
-			self.arrive_ticks = 0
-
-		arrived = self.arrive_ticks >= self.arrive_ticks_needed
-
-		if arrived:
-			forward, right, vd = 0.0, 0.0, 0.0
-			self.get_logger().info(f"arrived at ({self.target_north:.1f}, {self.target_east:.1f}, {self.target_down:.1f})")
-
-		self.send_velocity_body(forward, right, vd)
-
-		return arrived
-
-	async def enter_land(self):
-		await self.flight("land")
-
-	# ---------- helpers ----------
-
-	def distance_to_target(self):
-		dn = self.target_north - self.position_north
-		de = self.target_east - self.position_east
-		dd = self.target_down - self.position_down
-
-		return math.sqrt(dn * dn + de * de + dd * dd)
-
-	def send_velocity_body(self, forward, right, down, yaw_rate=0.0):
-		msg = OffboardNavCommand()
-
-		msg.command = "set_velocity_body"
-		msg.north = float(forward)
-		msg.east = float(right)
-		msg.down = float(down)
-		msg.yaw = float(yaw_rate)
-
-		self.offboard_publisher.publish(msg)
+		if result is not None:
+			self.get_logger().info(f"led set: {result.message}")
 
 	async def flight(self, command, value=0.0, timeout=30.0, north=0.0, east=0.0, down=0.0, yaw=0.0, check=True):
 		request = FlightCommand.Request()
@@ -260,7 +227,13 @@ class MissionNode(Node):
 
 		return True
 
-	# ---------- callbacks ----------
+	def on_go(self, request, response):
+		self.go_received = True
+
+		response.success = True
+		response.message = f"go received at phase {self.phase}"
+
+		return response
 
 	def on_position(self, msg):
 		self.position_north = msg.x
@@ -275,8 +248,10 @@ class MissionNode(Node):
 			if param.name != "mission_phase":
 				continue
 
-			if param.value < self.phase_min or param.value > self.phase_max:
-				return SetParametersResult(successful=False, reason=f"phase {param.value} out of range")
+			mission_length = len(self.build_mission())
+
+			if param.value < 0 or param.value >= mission_length:
+				return SetParametersResult(successful=False, reason=f"phase {param.value} out of range (0 to {mission_length - 1})")
 
 			self.phase_requested = param.value
 
@@ -297,22 +272,6 @@ class MissionNode(Node):
 		self.megadrone_time = data.get("time", self.megadrone_time)
 
 		self.get_logger().info(str(data), throttle_duration_sec=1.0)
-
-	def set_led_ring(self, color):
-		if not self.led_client.service_is_ready():
-			self.get_logger().warn("led service not ready, skipping")
-			return
-
-		request = LEDRingColor.Request()
-		request.color = color
-
-		self.led_client.call_async(request).add_done_callback(self.on_led_response)
-
-	def on_led_response(self, future):
-		try:
-			self.get_logger().info(f"led set: {future.result().message}")
-		except Exception as e:
-			self.get_logger().error(f"led call failed: {e}")
 
 
 def main():
