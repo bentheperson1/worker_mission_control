@@ -1,7 +1,8 @@
 import json
 import math
-
+import inspect
 import rclpy
+
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from rclpy.task import Future
@@ -88,6 +89,9 @@ class MissionNode(Node):
 		msg.data = message
 		self.megadrone_message_publisher.publish(msg)
 
+	def set_hatch(self, is_open):
+		self.send_megadrone_message(json.dumps({"open_hatch": is_open}))
+
 	def build_mission(self):
 		alt = float(self.get_parameter("initial_takeoff_altitude").value)
 
@@ -95,13 +99,13 @@ class MissionNode(Node):
 		target_lon = float(self.get_parameter("target_lon").value)
 
 		return [
-			("open hatch", lambda: self.send_megadrone_message("open")),
+			("open hatch", lambda: self.set_hatch(True)),
 
 			("confirm arm", lambda: self.wait_for_go("ready to arm and take off")),
 			("takeoff", lambda: self.takeoff(alt)),
 
 			("confirm fly out", lambda: self.wait_for_go(f"hovering, ready to fly to ({target_lat:.7f}, {target_lon:.7f})")),
-			("close hatch", lambda: self.send_megadrone_message("close")),
+			("close hatch", lambda: self.set_hatch(False)),
 			#("fly out", lambda: self.fly_to_gps(target_lat, target_lon, alt)),
 			("fly out", lambda: self.fly_to(10.0, 0, 0, 0, 5.0)),
 
@@ -113,7 +117,7 @@ class MissionNode(Node):
 
 			("confirm fly home", lambda: self.wait_for_go("hovering, ready to fly home")),
 			("fly home", lambda: self.fly_to_gps(0.0, 0.0, -alt)),
-			("open hatch", lambda: self.send_megadrone_message("open")),
+			("open hatch", lambda: self.set_hatch(True)),
 
 			("confirm final land", lambda: self.wait_for_go("home, ready to land")),
 			("land", lambda: self.land()),
@@ -139,20 +143,23 @@ class MissionNode(Node):
 
 	async def run_mission(self, start):
 		mission = self.build_mission()
-
+		
 		try:
 			for i in range(start, len(mission)):
 				name, action = mission[i]
-
+				
 				self.phase = i
 				self.get_logger().info(f"phase {i}: {name}")
-
-				await action()
+				
+				result = action()
+				
+				if inspect.isawaitable(result):
+					await result
 		except Exception as e:
 			self.get_logger().error(f"phase {self.phase} failed: {e}")
 			await self.abort()
 			return
-
+		
 		self.phase = -1
 		self.get_logger().info("mission complete")
 
@@ -371,7 +378,7 @@ class MissionNode(Node):
 		self.megadrone_satellites = data.get("satellites", self.megadrone_satellites)
 		self.megadrone_time = data.get("time", self.megadrone_time)
 
-		self.get_logger().info(str(data), throttle_duration_sec=1.0)
+		self.get_logger().info(str(data), throttle_duration_sec=5.0)
 
 
 def main():
