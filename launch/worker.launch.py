@@ -23,7 +23,7 @@ def generate_launch_description():
 		name = "megadrone_bridge_node",
 		output = "screen",
 		parameters = [{
-			"megadrone_websocket_url": "wss://ea20-76-78-191-9.ngrok-free.app",
+			"megadrone_websocket_url": "wss://ebfd-129-110-242-30.ngrok-free.app",
 			"megadrone_reconnect_delay": 5.0,
 		}],
 	)

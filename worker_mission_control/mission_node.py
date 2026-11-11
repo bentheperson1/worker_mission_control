@@ -89,8 +89,24 @@ class MissionNode(Node):
 		msg.data = message
 		self.megadrone_message_publisher.publish(msg)
 
-	def set_hatch(self, is_open):
+	async def async_sleep(self, duration_sec: float) -> None:
+		future = Future()
+
+		def _timer_callback():
+			if not future.done():
+				future.set_result(True)
+
+		timer = self.create_timer(duration_sec, _timer_callback)
+		try:
+			await future
+		finally:
+			timer.cancel()
+			self.destroy_timer(timer)
+
+	async def set_hatch(self, is_open):
 		self.send_megadrone_message(json.dumps({"open_hatch": is_open}))
+
+		await self.async_sleep(3.0)
 
 	def build_mission(self):
 		alt = float(self.get_parameter("initial_takeoff_altitude").value)
@@ -99,6 +115,7 @@ class MissionNode(Node):
 		target_lon = float(self.get_parameter("target_lon").value)
 
 		return [
+			("start mission", lambda: self.wait_for_go("node up, ready to start")),
 			("open hatch", lambda: self.set_hatch(True)),
 
 			("confirm arm", lambda: self.wait_for_go("ready to arm and take off")),
@@ -107,7 +124,7 @@ class MissionNode(Node):
 			("confirm fly out", lambda: self.wait_for_go(f"hovering, ready to fly to ({target_lat:.7f}, {target_lon:.7f})")),
 			("close hatch", lambda: self.set_hatch(False)),
 			#("fly out", lambda: self.fly_to_gps(target_lat, target_lon, alt)),
-			("fly out", lambda: self.fly_to(10.0, 0, 0, 0, 5.0)),
+			("fly out", lambda: self.fly_to(10.0, 0, -alt, 0, 60.0)),
 
 			("confirm land", lambda: self.wait_for_go("at target, ready to land")),
 			("land", lambda: self.land()),
@@ -116,7 +133,7 @@ class MissionNode(Node):
 			("takeoff", lambda: self.takeoff(alt)),
 
 			("confirm fly home", lambda: self.wait_for_go("hovering, ready to fly home")),
-			("fly home", lambda: self.fly_to_gps(0.0, 0.0, -alt)),
+			("fly home", lambda: self.fly_to(0.0, 0.0, -alt, 0, 60.0)),
 			("open hatch", lambda: self.set_hatch(True)),
 
 			("confirm final land", lambda: self.wait_for_go("home, ready to land")),
@@ -378,7 +395,7 @@ class MissionNode(Node):
 		self.megadrone_satellites = data.get("satellites", self.megadrone_satellites)
 		self.megadrone_time = data.get("time", self.megadrone_time)
 
-		self.get_logger().info(str(data), throttle_duration_sec=5.0)
+		self.get_logger().info(str(data), throttle_duration_sec=10.0)
 
 
 def main():
