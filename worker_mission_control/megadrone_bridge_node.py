@@ -21,6 +21,9 @@ class MegadroneBridgeNode(Node):
 		self.incoming = queue.Queue()
 		self.incoming_pub = self.create_publisher(String, "/megadrone/incoming", 10)
 		self.drain_timer = self.create_timer(0.01, self.drain_queue)
+
+		self.send_message_sub = self.create_subscription(String, "/megadrone/send", self.send_message, 10)
+		self.outgoing = queue.Queue()
 		
 		self.loop = asyncio.new_event_loop()
 		self.ws_thread = threading.Thread(target=self.run_loop, daemon=True)
@@ -42,15 +45,24 @@ class MegadroneBridgeNode(Node):
 			try:
 				async with websockets.connect(url) as ws:
 					self.get_logger().info(f"connected to {url}")
+					send_task = asyncio.create_task(self.send_messages(ws))
 					
-					async for raw in ws:
-						self.incoming.put(raw)
+					try:
+						async for raw in ws:
+							self.incoming.put(raw)
+					finally:
+						send_task.cancel()
 				
 				self.get_logger().warn(f"websocket closed, retrying in {delay}s")
 			except Exception as e:
 				self.get_logger().warn(f"websocket error: {type(e).__name__}: {e}, retrying in {delay}s")
 			
 			await asyncio.sleep(delay)
+
+	async def send_messages(self, ws):
+		while True:
+			msg = await asyncio.to_thread(self.outgoing.get)
+			await ws.send(msg)
 	
 	def drain_queue(self):
 		while not self.incoming.empty():
@@ -68,6 +80,8 @@ class MegadroneBridgeNode(Node):
 			msg.data = parsed
 			self.incoming_pub.publish(msg)
 
+	def send_message(self, msg):
+		self.outgoing.put(msg.data)
 
 def main():
 	rclpy.init()

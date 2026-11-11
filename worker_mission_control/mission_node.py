@@ -76,11 +76,17 @@ class MissionNode(Node):
 		self.position_sub = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.on_position, px4_qos)
 		self.megadrone_sub = self.create_subscription(String, "/megadrone/incoming", self.on_megadrone_msg, 10)
 
+		self.megadrone_message_publisher = self.create_publisher(String, "/megadrone/send", 10)
+
 		if not self.flight_client.wait_for_service(timeout_sec=10.0):
 			raise RuntimeError("/dexi/flight/command is not available; is the offboard manager running?")
 
 		self.tick_timer = self.create_timer(self.tick_rate, self.on_tick)
 
+	def send_megadrone_message(self, message):
+		msg = String()
+		msg.data = message
+		self.megadrone_message_publisher.publish(msg)
 
 	def build_mission(self):
 		alt = float(self.get_parameter("initial_takeoff_altitude").value)
@@ -89,16 +95,26 @@ class MissionNode(Node):
 		target_lon = float(self.get_parameter("target_lon").value)
 
 		return [
+			("open hatch", lambda: self.send_megadrone_message("open")),
+
 			("confirm arm", lambda: self.wait_for_go("ready to arm and take off")),
 			("takeoff", lambda: self.takeoff(alt)),
+
 			("confirm fly out", lambda: self.wait_for_go(f"hovering, ready to fly to ({target_lat:.7f}, {target_lon:.7f})")),
-			("fly out", lambda: self.fly_to_gps(target_lat, target_lon, alt)),
+			("close hatch", lambda: self.send_megadrone_message("close")),
+			#("fly out", lambda: self.fly_to_gps(target_lat, target_lon, alt)),
+			("fly out", lambda: self.fly_to(10.0, 0, 0, 0, 5.0)),
+
 			("confirm land", lambda: self.wait_for_go("at target, ready to land")),
 			("land", lambda: self.land()),
+
 			("confirm second takeoff", lambda: self.wait_for_go("landed, ready to take off again")),
 			("takeoff", lambda: self.takeoff(alt)),
+
 			("confirm fly home", lambda: self.wait_for_go("hovering, ready to fly home")),
 			("fly home", lambda: self.fly_to_gps(0.0, 0.0, -alt)),
+			("open hatch", lambda: self.send_megadrone_message("open")),
+
 			("confirm final land", lambda: self.wait_for_go("home, ready to land")),
 			("land", lambda: self.land()),
 		]
