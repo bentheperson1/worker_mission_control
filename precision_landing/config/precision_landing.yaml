@@ -1,0 +1,54 @@
+# Precision landing configuration.
+#
+# Used by the ROS node (param `config_file`) and the simulator (--config).
+# Every key is optional - omitted keys keep the defaults in
+# precision_landing/config.py, where each one is documented. Unknown keys are an
+# error on purpose (a typo must not silently fall back to a default).
+
+precision_landing:
+  tags:
+    # DEXI hardware tag: 36h11, 6 in (0.1524 m) black square. Measure YOUR tag -
+    # the size scales every distance estimate.
+    - tag_id: 0
+      size: 0.1524
+    # Nested-pad example: a small tag at the pad center keeps working below
+    # the height where the big one fills the image.
+    # - tag_id: 1
+    #   size: 0.05
+    #   offset: [0.0, 0.0, 0.0]   # tag center -> landing point, tag frame (x right, y down)
+
+  camera_mount:
+    # Direction the TOP of the image points, clockwise from the nose seen from
+    # above (0 = toward the nose). Verify on the bench: put the tag in front of
+    # the drone and check status.last_tag_body_frd reads +x.
+    image_up_heading_deg: 0.0
+    offset_body: [0.0, 0.0, 0.0]   # camera position relative to the FC, FRD meters
+
+  detection:
+    max_hamming: 0
+    max_reprojection_error_px: 3.0
+    pixel_noise_px: 1.0
+    level_prior_sigma_deg: 3.0     # 0 if the pad can tilt (moving deck)
+    extra_latency_s: 0.0           # raise if the camera driver stamps images late
+
+  tracker:
+    target_model: static           # "moving" for a pad on a moving platform
+
+  control:
+    kp_xy: 1.5
+    ki_xy: 0.5
+    kd_xy: 0.2
+    max_speed_xy_high: 1.0
+    max_speed_xy_low: 0.3
+    descent_speed_high: 0.6
+    descent_speed_low: 0.15
+    cone_half_angle_deg: 12.0
+
+  protocol:
+    search_pattern: spiral         # or "hover"
+    search_timeout_s: 45.0
+    search_max_radius: 3.0
+    handoff_height: 0.4
+    handoff_radius: 0.05
+    final_descent: land            # "land" (PX4 LAND) or "guided"
+    overall_timeout_s: 180.0
